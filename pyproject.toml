@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "github-auth-agent"
+version = "0.2.0"
+description = "GitHub device-flow auto-authenticator with macOS menu-bar UI"
+requires-python = ">=3.9"
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "requests>=2.28.0",
+    "pynput>=1.7.6",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+    "pyobjc-framework-Vision>=10.0",
+    "pyobjc-framework-Quartz>=10.0",
+    "pyobjc-framework-Cocoa>=10.0",
+]
+
+[project.scripts]
+auth-cli = "auth_cli:main"
+auth-daemon = "auth_daemon:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["auth_daemon", "auth_cli"]

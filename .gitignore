@@ -45,3 +45,12 @@ htmlcov/
 .cache/
 *.cache
 *.log
+.gitnexus
+
+# Local credentials & runtime state (never commit)
+github-auth.json
+.env
+daemon.log
+
+# Claude Code session state
+.claude/

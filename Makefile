@@ -1,58 +1,35 @@
-.PHONY: install test run daemon client status clean help
+.PHONY: help install daemon status stop clean app
 
 PYTHON := python3
 
 help:
-	@echo "Auth Daemon Makefile"
-	@echo "==================="
+	@echo "GitHub Auth Agent - macOS GitHub device-flow automation"
 	@echo ""
 	@echo "Targets:"
-	@echo "  make install    - Install daemon and CLI"
-	@echo "  make daemon     - Start auth daemon"
-	@echo "  make client     - Show CLI commands"
-	@echo "  make status     - Check daemon status"
-	@echo "  make test       - Run tests"
-	@echo "  make examples   - Run examples"
-	@echo "  make clean      - Clean cache and temp files"
-	@echo ""
+	@echo "  make install   - Install dependencies, CLI, shell hook, and /Applications app"
+	@echo "  make daemon    - Run the daemon (foreground)"
+	@echo "  make app       - Open /Applications/GitHubAuthAgent.app (menu-bar UI)"
+	@echo "  make status    - Check daemon status"
+	@echo "  make stop      - Stop a running daemon"
+	@echo "  make clean     - Remove caches and build artifacts"
 
 install:
-	@bash install.sh
+	@bash scripts/install.sh
 
 daemon:
-	@$(PYTHON) auth_daemon.py
+	@$(PYTHON) src/auth_daemon.py
 
-client:
-	@$(PYTHON) auth_cli.py --help
+app:
+	@open /Applications/GitHubAuthAgent.app
 
 status:
-	@$(PYTHON) auth_cli.py status
+	@$(PYTHON) src/auth_cli.py status
 
-test:
-	@$(PYTHON) -m pytest tests.py -v || $(PYTHON) tests.py
-
-examples:
-	@$(PYTHON) examples.py
+stop:
+	@$(PYTHON) src/auth_cli.py daemon stop
 
 clean:
-	@echo "Cleaning..."
 	@find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	@find . -type f -name "*.pyc" -delete
+	@find . -type f -name '*.pyc' -delete
 	@rm -rf build dist *.egg-info
-	@rm -f ~/.cache/auth-daemon/sessions.pkl
-	@echo "Done"
-
-.PHONY: install-dev
-install-dev: install
-	@$(PYTHON) -m pip install pytest black flake8 -q
-	@echo "✓ Dev dependencies installed"
-
-.PHONY: format
-format:
-	@$(PYTHON) -m black *.py --quiet
-	@echo "✓ Code formatted"
-
-.PHONY: lint
-lint:
-	@$(PYTHON) -m flake8 *.py --max-line-length=100
-	@echo "✓ Lint complete"
+	@echo "[clean] removed caches and build artifacts (credentials & logs left intact)"

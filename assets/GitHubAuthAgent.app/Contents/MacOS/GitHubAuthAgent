@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""GitHub Auth Agent - macOS menu-bar launcher.
+
+When this bundle is opened, it parks an icon in the system status bar
+and spawns `auth_daemon.py` as a child process. The status item exposes
+two actions:
+
+  - Logs    Opens Terminal and tails the daemon log.
+  - Quit    Terminates the daemon and exits.
+
+install.sh rewrites the shebang at install time to point at the python
+where the auth_daemon module was installed via `pip install -e .`.
+"""
+
+import sys
+sys.dont_write_bytecode = True  # avoid touching __pycache__ under ~/Documents
+
+import logging
+import os
+import subprocess
+import time
+import traceback
+from pathlib import Path
+
+# Launch Services-launched processes (parent=launchd) on macOS Tahoe get a
+# scene-bound NSStatusItem with a zero-height window — invisible in the menu
+# bar. Direct python invocations work fine. Detect the LS launch by checking
+# if our parent is launchd (pid 1) and re-spawn ourselves via double-fork so
+# the new launcher is parented by init but went through user fork/exec, not
+# direct LS launch.
+if os.getppid() == 1 and not os.environ.get("GHA_RELAUNCHED"):
+    clean_env = {k: v for k, v in os.environ.items()
+                 if not k.startswith(("XPC_", "__CF"))}
+    clean_env["GHA_RELAUNCHED"] = "1"
+    if os.fork() == 0:  # child
+        os.setsid()  # become session leader, detach from any terminal
+        if os.fork() == 0:  # grandchild
+            os.execvpe(sys.executable, [sys.executable, __file__], clean_env)
+        os._exit(0)
+    sys.exit(0)  # parent exits, leaving grandchild adopted by launchd but not direct LS launch
+
+DAEMON_PYTHON = sys.executable
+
+try:
+    import auth_daemon
+    DAEMON_FILE = auth_daemon.__file__
+    LOG_PATH = auth_daemon.LOG_PATH  # ~/Library/Logs/GitHub Auth Agent/auth-daemon.log
+    load_prefs = auth_daemon.load_prefs
+    save_prefs = auth_daemon.save_prefs
+except ImportError:
+    DAEMON_FILE = None
+    LOG_PATH = Path.home() / "Library" / "Logs" / "GitHub Auth Agent" / "auth-daemon.log"
+    load_prefs = lambda: {}
+    save_prefs = lambda _: None
+
+LAUNCHER_LOG = Path.home() / "Library" / "Logs" / "GitHub Auth Agent" / "launcher.log"
+LAUNCHER_LOG.parent.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.FileHandler(LAUNCHER_LOG)],
+)
+sys.excepthook = lambda t, v, tb: logging.error("unhandled: " + "".join(traceback.format_exception(t, v, tb)))
+
+from AppKit import (
+    NSAlert,
+    NSAlertFirstButtonReturn,
+    NSAlertStyleCritical,
+    NSAlertStyleWarning,
+    NSApp,
+    NSApplication,
+    NSApplicationActivationPolicyAccessory,
+    NSImage,
+    NSMenu,
+    NSMenuItem,
+    NSStatusBar,
+    NSVariableStatusItemLength,
+)
+from PyObjCTools import AppHelper
+from ApplicationServices import AXIsProcessTrusted
+from Foundation import NSObject
+from Quartz import CGPreflightScreenCaptureAccess
+
+PERMISSION_INFO = [
+    (
+        "Accessibility",
+        "to listen for Cmd+G globally",
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        AXIsProcessTrusted,
+    ),
+    (
+        "Screen Recording",
+        "to OCR the device code off your screen",
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+        CGPreflightScreenCaptureAccess,
+    ),
+]
+
+
+def _ensure_permissions() -> None:
+    """For each missing macOS permission, pop a native alert with an Open Settings button.
+    Only prompts once per identity; subsequent launches stay quiet so the user
+    isn't spammed if they decided to defer.
+    """
+    marker = Path.home() / ".config" / "auth-daemon" / "permission-prompted.flag"
+    if marker.exists():
+        return
+    for name, why, settings_url, check in PERMISSION_INFO:
+        if check():
+            continue
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(f"Grant {name} permission")
+        alert.setInformativeText_(
+            f"GitHub Auth Agent needs {name} permission {why}.\n\n"
+            f"Click Open Settings, find GitHub Auth Agent in the {name} list, "
+            "and toggle it on. Then relaunch the app."
+        )
+        alert.setAlertStyle_(NSAlertStyleWarning)
+        alert.addButtonWithTitle_("Open Settings")
+        alert.addButtonWithTitle_("Later")
+        if alert.runModal() == NSAlertFirstButtonReturn:
+            subprocess.Popen(["open", settings_url],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    marker.touch()
+
+BUNDLE_DIR = Path(__file__).resolve().parent.parent  # GitHubAuthAgent.app/Contents
+ICON_PATH = BUNDLE_DIR / "Resources" / "menubar.png"
+
+
+class StatusBarApp(NSObject):
+    def setup(self):
+        """Initialize daemon + status bar. Called before runEventLoop, like rumps does."""
+        logging.info("setup")
+        self.daemon_proc = None
+
+        # Single-owner invariant: kill any stray daemon, then spawn ours.
+        subprocess.run(["pkill", "-f", "auth_daemon.py"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        time.sleep(0.3)
+
+        if DAEMON_FILE:
+            env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+            self.daemon_proc = subprocess.Popen(
+                [DAEMON_PYTHON, DAEMON_FILE],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, env=env,
+            )
+            logging.info(f"spawned daemon pid={self.daemon_proc.pid} via {DAEMON_PYTHON}")
+
+        bar = NSStatusBar.systemStatusBar()
+        self.status_item = bar.statusItemWithLength_(NSVariableStatusItemLength)
+        logging.info(f"status_item class={self.status_item.className()}")
+        button = self.status_item.button()
+        image = NSImage.alloc().initWithContentsOfFile_(str(ICON_PATH))
+        if image is not None:
+            image.setSize_((18, 18))
+            image.setTemplate_(True)
+            button.setImage_(image)
+        else:
+            symbol = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "person.badge.key.fill", "GitHub Auth Agent")
+            if symbol is not None:
+                button.setImage_(symbol)
+            else:
+                button.setTitle_("GHA")
+        button.setToolTip_("GitHub Auth Agent")
+
+        menu = NSMenu.alloc().init()
+
+        logs_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Open Logs in Terminal", "openLogs:", "l")
+        logs_item.setTarget_(self)
+        menu.addItem_(logs_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        headed_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Show browser window", "toggleHeaded:", "")
+        headed_item.setTarget_(self)
+        headed_item.setState_(0 if load_prefs().get("headless", True) else 1)
+        menu.addItem_(headed_item)
+        self.headed_item = headed_item
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Quit", "quit:", "q")
+        quit_item.setTarget_(self)
+        menu.addItem_(quit_item)
+
+        self.status_item.setMenu_(menu)
+
+    def toggleHeaded_(self, sender):
+        prefs = load_prefs()
+        new_headless = not prefs.get("headless", True)
+        prefs["headless"] = new_headless
+        save_prefs(prefs)
+        sender.setState_(0 if new_headless else 1)
+
+    def openLogs_(self, sender):
+        # AppleScript with single-quoted shell arg keeps any spaces in the path safe.
+        applescript = (
+            'tell application "Terminal"\n'
+            f"    do script \"tail -n 200 -f '{LOG_PATH}'\"\n"
+            "    activate\n"
+            "end tell"
+        )
+        subprocess.Popen(["osascript", "-e", applescript],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def quit_(self, sender):
+        if self.daemon_proc and self.daemon_proc.poll() is None:
+            try:
+                self.daemon_proc.terminate()
+                self.daemon_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.daemon_proc.kill()
+        # Belt-and-suspenders: reap any daemon we didn't spawn directly.
+        subprocess.run(["pkill", "-f", "auth_daemon.py"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        NSApp.terminate_(self)
+
+
+def _fail(message: str) -> None:
+    alert = NSAlert.alloc().init()
+    alert.setMessageText_("GitHub Auth Agent")
+    alert.setInformativeText_(message)
+    alert.setAlertStyle_(NSAlertStyleCritical)
+    alert.runModal()
+
+
+_controller = None  # keep the delegate alive for the run loop
+
+
+def main() -> int:
+    global _controller
+    from Foundation import NSBundle
+    mb = NSBundle.mainBundle()
+    logging.info(f"launcher pid={os.getpid()} bundle={mb.bundleIdentifier()} path={mb.bundlePath()}")
+    app = NSApplication.sharedApplication()
+    app.activateIgnoringOtherApps_(True)
+
+    if DAEMON_FILE is None:
+        _fail("Could not import auth_daemon. Run `bash scripts/install.sh` "
+              "from the project directory, then launch this app again.")
+        return 1
+
+    _ensure_permissions()
+
+    _controller = StatusBarApp.alloc().init()
+    app.setDelegate_(_controller)
+    _controller.setup()  # rumps-style: status item created BEFORE runEventLoop
+    logging.info("calling AppHelper.runEventLoop()")
+    AppHelper.runEventLoop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
